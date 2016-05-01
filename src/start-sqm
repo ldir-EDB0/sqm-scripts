@@ -50,6 +50,22 @@ if [ ! -f "${SQM_LIB_DIR}/$SCRIPT" ]; then
     exit 1
 fi
 
+if [ "pppoa-wan" = "$IFACE" -a -f /lib/functions/lantiq_dsl.sh ]; then
+     . /lib/functions/lantiq_dsl.sh
+
+     csg=$(dsl_cmd g997csg 0 1)
+     drd=$(dsl_val "$csg" ActualDataRate)
+     csg=$(dsl_cmd g997csg 0 0)
+     dru=$(dsl_val "$csg" ActualDataRate)
+
+     [ -z "$drd" ] && drd=256000
+     [ -z "$dru" ] && dru=128000
+     DOWNLINK=$(( ${drd} * 99 / 100000 ))
+     UPLINK=$(( ${dru} * 99 / 100000 ))
+
+     sqm_log "ADSL Interface ${drd} down, ${dru} up"
+fi
+
 . "${SQM_LIB_DIR}/$SCRIPT"
 
 sqm_trace; sqm_trace "$(date): Starting." # Add some space and a date stamp to verbose log output and log files to separate runs
