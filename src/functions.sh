@@ -535,6 +535,12 @@ sqm_stop() {
     [ -n "$CUR_IFB" ] && $IP link set dev ${CUR_IFB} down
     [ -n "$CUR_IFB" ] && $IP link delete ${CUR_IFB} type ifb
     [ -n "$CUR_IFB" ] && sqm_debug "${0}: ${CUR_IFB} interface deleted"
+
+    fn_exists ipt_destruct
+    if [ "$?" -eq "0" ]; then
+	ipt_destruct
+    fi
+
 }
 
 # Note this has side effects on the prio variable
