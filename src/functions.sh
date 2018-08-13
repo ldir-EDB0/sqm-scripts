@@ -166,12 +166,12 @@ ipt() {
 
 # wrapper to call iptables to allow debug logging
 iptables_wrapper(){
-    cmd_wrapper iptables ${IPTABLES_BINARY} "$@"
+    cmd_wrapper iptables ${IPTABLES_BINARY} "-w" "$@"
 }
 
 # wrapper to call ip6tables to allow debug logging
 ip6tables_wrapper(){
-    cmd_wrapper ip6tables ${IP6TABLES_BINARY} "$@"
+    cmd_wrapper ip6tables ${IP6TABLES_BINARY} "-w" "$@"
 }
 
 # wrapper to call tc to allow debug logging
@@ -535,6 +535,12 @@ sqm_stop() {
     [ -n "$CUR_IFB" ] && $IP link set dev ${CUR_IFB} down
     [ -n "$CUR_IFB" ] && $IP link delete ${CUR_IFB} type ifb
     [ -n "$CUR_IFB" ] && sqm_debug "${0}: ${CUR_IFB} interface deleted"
+
+    fn_exists ipt_destruct
+    if [ "$?" -eq "0" ]; then
+	ipt_destruct
+    fi
+
 }
 
 # Note this has side effects on the prio variable

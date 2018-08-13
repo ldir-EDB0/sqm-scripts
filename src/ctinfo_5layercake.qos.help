@@ -1,0 +1,4 @@
+Uses CAKE's diffserv5 classifications: Least Effort, Bulk, Best Effort, Video,
+Voice in combination with act_ctinfo and CONNMARK --savedscp-mark to restore
+DSCP classifications on ingress.
+'Long term' Best Effort traffic is automagically de-prioritised to Bulk.

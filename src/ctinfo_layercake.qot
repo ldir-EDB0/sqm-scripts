@@ -1,0 +1,534 @@
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License version 2 as published by the
+# Free Software Foundation.
+#
+# Copyright (C) 2012-5 Michael D. Taht, Toke Høiland-Jørgensen, Sebastian
+# Moeller Additional hackery & standing on shoulders of giants (C) 2019 Kevin
+# Darbyshire-Bryant
+#
+# This script is offered on the basis that it works for me and might be useful
+# to others, but if it breaks you may keep all the pieces at no cost :-)
+#
+# diffserv5 takes advantage of a patched CAKE diffserv5 mode offering 5 tins of
+# classification Least Effort, Bulk, Best Effort, Video, Voice.  The difference
+# between diffserv4 & diffserv5 is that diffserv5 has a tin for Least Effort,
+# whilst diffserv4 maps Least Effort into Bulk.  Thus diffserv4 treats my
+# bittorrent as equal priority to my backups.  Bittorrent can wait, my backups
+# must complete! For me classification is less about absolute priority, though
+# that is important, and more about minimum bandwidth allocation. eg. Voice gets
+# highest priority but is guaranteed a minimum 1/4 bandwidth.  Video is not
+# quite as high priority but gets a minimum of 1/2 bandwidth.  Bulk only gets
+# 1/16 bandwidth and Least Effort is down in the noise.
+#
+# By default CAKE uses DSCP values as a key into the priority tins.
+# Applications that set a DSCP (eg dropbear ssh) should IMO have that
+# respected/used.  CAKE offers other tin keying methods eg. fwmark.  This (by
+# design) ignores any DSCP values, so if you wanted DSCP to have influence
+# whilst using that you would have to write many x_tables rules to translate
+# DSCP to tin (ie emulating the lookup cake already has)  For this reason I use
+# DSCP as the tin priority key mechanism.
+#
+# DSCP values on egress are easy to find & manipulate.  Ingress is harder
+# because CAKE will have already handled the packet before x_tables gets a
+# chance to even see it.  tc actions do happen before qdiscs like CAKE so
+# it's possible to do something via the tc action mechanism.
+#
+# What I really wanted to do was store the DSCP value for a connection into the
+# firewall and use that stored DSCP as the key in to CAKE's tin selection on
+# ingress.  Storing DSCP on egress and restoring on ingress is also more useful
+# to qdiscs other than CAKE
+#
+# act_ctinfo was written and is in kernel 5.3,  This restores a DSCP value
+# stored in the firewall into a packet's DSCP field.  The companion 'store'
+# function has not yet made it upstream, being somewhat stalled by my bad C and
+# requirement for an nftables implementation and I quite frankly have no idea
+# how to write for nftables.  A 'hacked' together implementation for iptables
+# does exist, is in OpenWrt and that's what is used here.
+#
+# This script implements a 'dual level' of classification setting.  The 'static'
+# or fixed layer applies static DSCP values to known host/port combinations.
+#
+# Traffic that isn't in this known set of rules and is unclassified is monitored
+# for data use.  If the connection exceeds a traffic threshold the connection
+# is 'hooked' by a 2nd rule and the traffic is demoted from Best Effort to
+# Bulk.
+#
+# How it works
+#
+# We usurp top byte of the firewall connmark for our own purposes.
+#
+# bits 3-8 = DSCP
+# bit  2   = DSCPSet flag - DSCP is stored in bits 3-8 but may be changed (0x02)
+# bit  1   = DSCPFixed flag - DSCP is long-term fixed (0x01)
+#
+# DSCPSet bit lets 'ctinfo' know there's a DSCP value stored in the firewall
+# connmark.
+# DSCPFixed bit lets us know if we should consider running the 'long-term'
+# de-prioritising rules.
+#
+# egress packets are hooked by an iptables rule. if DSCPS & DSCPF unset they are
+# passed to a 'static' hosts/port ruleset chain.  This chain sets any applicable
+# DSCP in the packet based on host/port/ipset and then uses connmark savedscp to
+# store that DSCP value along with DSCPS bit into firewall's connmark.
+# Another rule hooks packets that have DSCPS set, DSCPF unset and a conntrack
+# connbytes value bigger than CONNB.  This is the dynamic de-prioritisation
+# rule whichchanges connections that are currently Best Effort to
+# BULK and sets DSCPF
+#
+# ctinfo instances are set on both ingress and egress paths.  The ingress path
+# restores DSCPs set for this known connection from the firewall connmark.
+# ctinfo on egress may not be quite so obvious to understand.  It is there to
+# copy the previously set DSCP value to all corresponding egress packets and
+# thus eliminate the requirement for each packet to pass through the 'static'
+# ruleset.
+#
+# iptables does not make 'if then else' constructs easy to implement.  Considered
+# use of '-j' jump (effectively a 'call/return') vs '-g' goto is used across
+# more chains that I'd like to emulate 'if then else'
+#
+# if DSCPF = 0 {
+# 	if DSCPS = 0 {
+# 		if DSCP != 0 {
+# 			Possibly Re-map DSCP
+# 			Store DSCP and set DSCPF
+#		} else {
+#			update DSCP based on ipset/host/port rules
+#			Store DSCP
+#			if DSCP != 0 {
+#				set DSCPF
+#			}
+#		}
+# 	} else {
+#		if Connection_transfer > Threshold {
+#			Set DSCP to Bulk
+#			Store DSCP and set DSCPF
+#		}
+# 	}
+# }
+#
+# Installation
+#
+# This script goes into /usr/lib/sqm along with all the other 'sqm-scripts'
+# scripts.
+#
+# It has dependencies on some ipsets which must be configured in /etc/config/firewall
+#
+#config ipset
+#	option enabled '1'
+#	option name 'BK_4'
+#	option storage 'hash'
+#	option family 'ipv4'
+#	option match 'src_ip'
+#	option timeout '86400'
+#
+#config ipset
+#	option enabled '1'
+#	option name 'BK_6'
+#	option storage 'hash'
+#	option family 'ipv6'
+#	option match 'src_ip'
+#	option timeout '86400'
+#
+#config ipset
+#	option enabled '1'
+#	option name 'BE_4'
+#	option storage 'hash'
+#	option family 'ipv4'
+#	option match 'src_ip'
+#	option timeout '86400'
+#config ipset
+#	option enabled '1'
+#	option name 'BE_6'
+#	option storage 'hash'
+#	option family 'ipv6'
+#	option match 'src_ip'
+#	option timeout '86400'
+#
+#config ipset
+#	option enabled '1'
+#	option name 'VI_4'
+#	option storage 'hash'
+#	option family 'ipv4'
+#	option match 'src_ip'
+#	option timeout '86400'
+#
+#config ipset
+#	option enabled '1'
+#	option name 'VI_6'
+#	option storage 'hash'
+#	option family 'ipv6'
+#	option match 'src_ip'
+#	option timeout '86400'
+#
+#config ipset
+#	option enabled '1'
+#	option name 'VO_4'
+#	option storage 'hash'
+#	option family 'ipv4'
+#	option match 'src_ip'
+#	option timeout '86400'
+#
+#config ipset
+#	option enabled '1'
+#	option name 'VO_6'
+#	option storage 'hash'
+#	option family 'ipv6'
+#	option match 'src_ip'
+#	option timeout '86400'
+#
+#config ipset
+#	option enabled '1'
+#	option name 'Zoom_4'
+#	option storage 'hash'
+#	option family 'ipv4'
+#	option match 'src_ip'
+#	option timeout '86400'
+#
+#config ipset
+#	option enabled '1'
+#	option name 'Zoom_6'
+#	option storage 'hash'
+#	option family 'ipv6'
+#	option match 'src_ip'
+#	option timeout '86400'
+#
+# Configuring the ipsets isn't enough, we must tell dnsmasq to populate them
+# /etc/config/dhcp in the 'config dnsmasq' section - you MUST tweak these to your needs
+#
+#	list ipset '/zoom.us/Zoom_4,Zoom_6'
+#	list ipset '/googlevideo.com/VI_4,VI_6'
+#	list ipset '/nflxvideo.net/rangeA-netflix.cdn.enbgk.isp.sky.com/VI_4,VI_6'
+#	list ipset '/aiv-cdn.net/r.cloudfront.net/aiv-delivery.net/VI_4,VI_6'
+#	list ipset '/s.loris.llnwd.net/as-dash-uk-live.bbcfmt.s.llnwi.net/as-dash-uk-live.bbcfmt.hs.llnwd.net /aod-dash-uk-live.bbcfmt.hs.llnwd.net/aod-dash-uk-live.akamaized.net/as-dash-uk-live.akamaized.net/a.files.bbci.co.uk/VI_4,VI_6'
+#	list ipset '/as-hls-uk-live.akamaized.net/VI_4,VI_6'
+#	list ipset '/vs-dash-uk-live.akamaized.net/VI_4,VI_6'
+#	list ipset '/cdn.bllon.isp.sky.com/live.bidi.net.uk/VI_4,VI_6'
+#	list ipset '/ssl-bbcdotcom.2cnt.net/VI_4,VI_6'
+#	list ipset '/fbcdn.net/VI_4,VI_6'
+#	list ipset '/ttvnw.net/VI_4,VI_6'
+#	list ipset '/w69.akamai.net/VI_4,VI_6'
+#	list ipset '/akamaihd.net/VI_4,VI_6'
+#	list ipset '/vevo.com/VI_4,VI_6'
+#	list ipset '/millicast.com/VI_4,VI_6'
+#	list ipset '/xirsys.com/VI_4,VI_6'
+#	list ipset '/audio-fa.scdn.cot/VI_4,VI_6'
+#	list ipset '/deezer.com/VI_4,VI_6'
+#	list ipset '/sndcdn.com/VI_4,VI_6'
+#	list ipset '/last.fm/VI_4,VI_6'
+#	list ipset '/v.redd.it/VI_4,VI_6'
+#	list ipset '/ttvnw.net/VI_4,VI_6'
+#	list ipset '/ms-acdc.office.com/windowsupdate.com/update.microsoft.com/BK_4,BK_6'
+#	list ipset '/1drv.ms/1drv.com/BK_4,BK_6'
+#	list ipset '/graph.microsoft.com/BE_4,BE_6'
+#	list ipset '/web.whatsapp.com/BE_4,BE_6'
+#	list ipset '/pub.3gppnetwork.org/VO_4,VO_6'
+#
+# sqm-scripts advanced configuration options that I use for my Sky UK VDSL connection:
+#
+# Ingress options IQDISC_OPTS
+# dual-dsthost bridged-ptm ether-vlan nat mpu 72 ingress
+#
+# Egress options EQDISC_OPTS
+# dual-srchost bridged-ptm ether-vlan nat mpu 72 ack-filter
+
+. /lib/functions/network.sh
+. ${SQM_LIB_DIR}/defaults.sh
+QDISC=cake
+
+# Basic Configuration Options
+#
+# do we want LE/BK differentiation, ie. have the patched diffserv5 mode?
+[ "$1" -eq 5 ] && LESUPPORT=1 || LESUPPORT=0
+# Duration in seconds for flow to be de-prioritised
+DURUP=30
+DURDN=30
+
+# where to store our status in connmark (0-24)
+# in this case, top byte
+SHIFTVAL=24
+
+DSCPS=$(( 2 << ${SHIFTVAL} ))
+DSCPF=$(( 1 << ${SHIFTVAL} ))
+DSCPSF=$(( ${DSCPS} | ${DSCPF} ))
+
+DSCP=$(( 0xfc << ${SHIFTVAL} ))
+CS1F=$(( ((8 << 2) << ${SHIFTVAL} ) | ${DSCPF} ))
+
+# simplified Rate * 1000 * duration / 9 ie 1000/9 = 111
+CONNBDN=$(( ${DOWNLINK} * 111 * ${DURDN} ))
+CONNBUP=$(( ${UPLINK}   * 111 * ${DURUP} ))
+
+if [ "$LESUPPORT" -eq 1 ] ; then
+	INGRESS_CAKE_OPTS="diffserv5"
+	EGRESS_CAKE_OPTS="diffserv5"
+else
+	INGRESS_CAKE_OPTS="diffserv4"
+	EGRESS_CAKE_OPTS="diffserv4"
+fi
+
+nslookup pub.3gppnetwork.org >/dev/null 2>&1
+
+network_get_subnet SUBNET lan
+network_find_wan6 ifc_wan6 && network_get_prefix6 PREFIX "${ifc_wan6}"
+
+egress() {
+    SILENT=1 $TC qdisc del dev $IFACE root
+    $TC qdisc add dev $IFACE root cake bandwidth ${UPLINK}kbit \
+	    $( get_cake_lla_string ) ${EGRESS_CAKE_OPTS} ${EQDISC_OPTS}
+
+    # Put act_ctinfo on the egress interface to set DSCP from the stored connmark.
+    # This seems counter intuitive but it ensures once the mark is set that all
+    # subsequent egress packets have the same stored DSCP. This avoids the need
+    # for iptables run/mark every packet.
+
+    $TC filter add dev $IFACE protocol all u32 \
+	match u32 0 0 \
+	action ctinfo dscp ${DSCP} ${DSCPS}
+}
+
+
+ingress() {
+
+    SILENT=1 $TC qdisc del dev $IFACE handle ffff: ingress
+    $TC qdisc add dev $IFACE handle ffff: ingress
+
+    SILENT=1 $TC qdisc del dev $DEV root
+
+    [ "$ZERO_DSCP_INGRESS" -eq "1" ] && INGRESS_CAKE_OPTS="$INGRESS_CAKE_OPTS wash"
+
+    $TC qdisc add dev $DEV root cake bandwidth ${DOWNLINK}kbit \
+	    $( get_cake_lla_string ) ${INGRESS_CAKE_OPTS} ${IQDISC_OPTS}
+
+    $IP link set dev $DEV up
+
+    # restore DSCP from conntrack mark into packet
+    # redirect all packets arriving in $IFACE to ifb0
+    $TC filter add dev $IFACE parent ffff: protocol all u32 \
+	match u32 0 0 \
+	action ctinfo dscp ${DSCP} ${DSCPS} \
+	action mirred egress redirect dev $DEV
+}
+
+ipt_setup() {
+    # Configure iptables chains to mark packets
+    ipt -t mangle -N QOS_CAKE_${IFACE}
+    ipt -t mangle -N QOS_MARK_F_${IFACE}
+    ipt -t mangle -N QOS_MARK_F_REMAP_${IFACE}
+    ipt -t mangle -N QOS_MARK_D_${IFACE}O
+    ipt -t mangle -N QOS_MARK_D_${IFACE}R
+    ipt -t mangle -N QOS_MARK_D_orig_${IFACE}
+    ipt -t mangle -N QOS_MARK_D_repl_${IFACE}
+
+# 'non-dynamic, fixed' rules
+#
+# Change DSCP of relevant ipsets/hosts/ports and store the DSCP to connmark using savedscp
+
+#ipv4
+#
+# Bluray
+ipset -q add VI_4  bluray timeout 0
+# AV-Amp
+ipset -q add VI_4  [av-amp] timeout 0
+
+# >>> QOS_MARK_F_REMAP_${IFACE} - DSCP remapping chain
+if [ "${LESUPPORT}" = 1 ]; then
+	# Customise
+	# if it's DSCP LE & tcp and from my NAS then re-map to BK, as it's backup traffic
+	ipt -t mangle -A QOS_MARK_F_REMAP_${IFACE} -m dscp --dscp 0x01 -p tcp -s waldorf -m tcp -m multiport ! --sports 6981 -j DSCP --set-dscp-class CS1
+	ipt -t mangle -A QOS_MARK_F_REMAP_${IFACE} -m dscp --dscp 0x08 -p tcp -s waldorf -m tcp -m multiport --sports 6981 -j DSCP --set-dscp 1
+	# if it's DSCP CS1 & udp and from my NAS then it turns out it's bittorrent make that LE
+	ipt -t mangle -A QOS_MARK_F_REMAP_${IFACE} -m dscp --dscp 0x08 -p udp -s waldorf -j DSCP --set-dscp 1
+	# End Customise
+else
+	# Customise
+	#I have nothing to do here, but YOU may want to add rules to change non BK/LE traffic
+	false
+	# End Customise
+fi
+# save it
+ipt -t mangle -A QOS_MARK_F_REMAP_${IFACE} -j CONNMARK --set-dscpmark ${DSCP}/${DSCPSF}
+# <<< the end
+
+# >>> QOS_MARK_F_${IFACE} The FIXED rules
+# if dscp not = 0 then special case packets that already have an application set DSCP
+# goto QOS_MARK_F_REMAP_${IFACE}
+ipt  -t mangle -A QOS_MARK_F_${IFACE} -m dscp ! --dscp 0x00 -g QOS_MARK_F_REMAP_${IFACE}
+
+# else fall through
+
+# Customise
+
+# ipv4 rules
+#
+# Bittorrent box - is a PAIN & keeps changing. Currently it sends BT UDP traffic as Bulk so that gets dealt with
+# by the remap chain above BUT the BT TCP traffic isn't marked, not only that it doesn't come from a fixed port
+# anymore.  So I have to assume it is BT traffic unless it matches some known ports
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -s waldorf -m tcp -m multiport ! --sports 12557 -m multiport ! --dports 443,22 -m comment --comment "BT DSCP LE" -j DSCP --set-dscp 1
+
+# traffic in ipv4 ipset matches
+# If you want a connection to remain as CS0 Best Effort, you force the DSCP Fixed bit
+if [ "${LESUPPORT}" = 1 ]; then
+	$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set LE_4 dst -j DSCP --set-dscp 1 -m comment --comment "LE ipset"
+	$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set LE_4 src -j DSCP --set-dscp 1 -m comment --comment "LE ipset"
+fi
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set BK_4 dst -j DSCP --set-dscp-class CS1 -m comment --comment "Bulk CS1 ipset"
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set BK_4 src -j DSCP --set-dscp-class CS1 -m comment --comment "Bulk CS1 ipset"
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set BE_4 dst -j CONNMARK --set-xmark ${DSCPF}/${DSCPF} -m comment --comment "Best Effort CS0 ipset"
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set BE_4 src -j CONNMARK --set-xmark ${DSCPF}/${DSCPF} -m comment --comment "Best Effort CS0 ipset"
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set VI_4 dst -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set VI_4 src -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set VO_4 dst -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set VO_4 src -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+
+# ipv6
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -s waldorf -m tcp -m multiport ! --sports 12557 -m multiport ! --dports 443,22 -m comment --comment "BT DSCP LE" -j DSCP --set-dscp 1
+
+# traffic in ipv6 ipset matches
+# If you want a connection to remain as CS0 Best Effort, you force the DSCP Fixed bit
+if [ "${LESUPPORT}" = 1 ]; then
+	$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set LE_6 dst -j DSCP --set-dscp 1 -m comment --comment "LE ipset"
+	$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set LE_6 src -j DSCP --set-dscp 1 -m comment --comment "LE ipset"
+fi
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set BK_6 dst -j DSCP --set-dscp-class CS1 -m comment --comment "Bulk CS1 ipset"
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set BK_6 src -j DSCP --set-dscp-class CS1 -m comment --comment "Bulk CS1 ipset"
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set BE_6 dst -j CONNMARK --set-xmark ${DSCPF}/${DSCPF} -m comment --comment "Best Effort CS0 ipset"
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set BE_6 src -j CONNMARK --set-xmark ${DSCPF}/${DSCPF} -m comment --comment "Best Effort CS0 ipset"
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set VI_6 dst -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set VI_6 src -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set VO_6 dst -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set VO_6 src -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+
+# back to some host/application specific
+#unificontroller
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -s unificontroller -m tcp -m multiport --dports 8883 -m comment --comment "UnifiController CS0 BE" -j CONNMARK --set-xmark ${DSCPF}/${DSCPF}
+
+#Apple push notification/mail
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -d 17.0.0.0/8 -m tcp -m multiport --dports 5223,993 -m comment --comment "APNS,mail CS0 BE" -j CONNMARK --set-xmark ${DSCPF}/${DSCPF}
+
+#Facetime is interesting. Apple say that for firewall purposes only certain ports are used, they don't say if that's source
+#or destination. Turns out it's both, so look for connections with both a source & destination port in the Facetime range
+ipt -t mangle -A QOS_MARK_F_${IFACE} -p udp -m udp -m multiport --sports 3478:3497,16384:16387,16393:16402 -m multiport --dports 3478:3497,16384:16387,16393:16402,16609:16618 -m comment --comment "Facetime CS3 Vid" -j DSCP --set-dscp-class CS3
+
+#Zoom - connections go to Zoom servers with dest ports 8801-8810
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p udp -m udp -m set --match-set Zoom_4 dst -m multiport --dports 8801:8810 -j DSCP --set-dscp-class CS3 -m comment --comment "Zoom CS3 VI"
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p udp -m udp -m set --match-set Zoom_6 dst -m multiport --dports 8801:8810 -j DSCP --set-dscp-class CS3 -m comment --comment "Zoom CS3 VI"
+
+#Whatsapp Video
+ipt -t mangle -A QOS_MARK_F_${IFACE} -p udp -m udp -m multiport --dports 3478 -m comment --comment "Whatsapp CS3 VI" -j DSCP --set-dscp-class CS3
+
+#Irc
+ipt -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m tcp -m multiport --dports 6697 -m comment --comment "IRC CS0 BE" -j CONNMARK --set-xmark 0x01000000/0x01000000
+
+#Icmp/v6
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p icmp -m comment --comment "Ping CS0 BE" -j CONNMARK --set-xmark ${DSCPF}/${DSCPF}
+#$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p icmpv6 -m comment --comment "Ping CS0 BE" -j CONNMARK --set-xmark ${DSCPF}/${DSCPF}
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p icmp -m icmp --icmp-type 0 -m comment --comment "Ping CS6 VO" -j DSCP --set-dscp-class CS6
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p icmpv6 -m icmp6 --icmpv6-type 129 -m comment --comment "Ping CS6 VO" -j DSCP --set-dscp-class CS6
+
+#Wireguard
+ipt -t mangle -A QOS_MARK_F_${IFACE} -p udp -m udp -m multiport --sports 51820 -m comment --comment "WG CS0 BE" -j CONNMARK --set-xmark ${DSCPF}/${DSCPF}
+
+
+# End Customise
+# Store the decided DSCP into connmark (for later restoration by ctinfo)
+ipt -t mangle -A QOS_MARK_F_${IFACE} -j CONNMARK --set-dscpmark ${DSCP}/${DSCPS}
+# if we stored a non best effort DSCP then set DSCPF bit to lock it in place, there's no traffic based deprioritisation required
+ipt -t mangle -A QOS_MARK_F_${IFACE} -m connmark ! --mark 0/${DSCP} -j CONNMARK --set-xmark ${DSCPF}/${DSCPF}
+# <<< ---- End of 'hard/fixed' rules
+
+
+# >>> Dynamic rules - These get run when a connection first goes above our bulk transfer size limit.
+# Set the stored DSCP to CS1 (bulk) - this is the dynamic de-prioritisation.
+# CS1 = 8 << 2 = 0x20, setting our Fixed bit = 0x21
+ipt -t mangle -A QOS_MARK_D_${IFACE}O -j CONNMARK --set-xmark ${CS1F}/${CS1F}
+$IPTABLES -t mangle -A QOS_MARK_D_${IFACE}O -j SET --add-set BK_4 dst --exist
+$IP6TABLES -t mangle -A QOS_MARK_D_${IFACE}O -j SET --add-set BK_6 dst --exist
+
+ipt -t mangle -A QOS_MARK_D_${IFACE}R -j CONNMARK --set-xmark ${CS1F}/${CS1F}
+$IPTABLES -t mangle -A QOS_MARK_D_${IFACE}R -j SET --add-set BK_4 src --exist
+$IP6TABLES -t mangle -A QOS_MARK_D_${IFACE}R -j SET --add-set BK_6 src --exist
+# <<< --- End of Dynamic Rules
+
+
+# >>> It all starts here.  This is the entry point that combines all the above rules
+# CAKE chain to combine hard/dynamic rules
+# Send unmarked connections to the hard/fixed marking chain
+ipt -t mangle -A QOS_CAKE_${IFACE} -m connmark --mark 0/${DSCPS} -g QOS_MARK_F_${IFACE}
+# Send marked connections over CONNB bytes and not DSCPFixed to the dynamic rules
+# original direction first - the original src ip is local
+# ipv4
+if [ "$SUBNET" ] ; then
+	$IPTABLES -t mangle -A QOS_CAKE_${IFACE} -m conntrack --ctorigsrc ${SUBNET} -g QOS_MARK_D_orig_${IFACE}
+	$IPTABLES -t mangle -A QOS_CAKE_${IFACE} -m conntrack --ctreplsrc ${SUBNET} -g QOS_MARK_D_repl_${IFACE}
+
+	# orig direction
+	$IPTABLES -t mangle -A QOS_MARK_D_orig_${IFACE} \
+	-m connbytes --connbytes ${CONNBUP} --connbytes-dir original --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}O
+	$IPTABLES -t mangle -A QOS_MARK_D_orig_${IFACE} \
+	-m connbytes --connbytes ${CONNBDN} --connbytes-dir reply  --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}O
+
+	# reply direction - reply src IP is local
+	$IPTABLES -t mangle -A QOS_MARK_D_repl_${IFACE} \
+	-m connbytes --connbytes ${CONNBDN} --connbytes-dir original --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}R
+	$IPTABLES -t mangle -A QOS_MARK_D_repl_${IFACE} \
+	-m connbytes --connbytes ${CONNBUP} --connbytes-dir reply --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}R
+fi
+
+# and now for ipv6.
+if [ "$PREFIX" ] ; then
+	$IP6TABLES -t mangle -A QOS_CAKE_${IFACE} -m conntrack --ctorigsrc ${PREFIX} -g QOS_MARK_D_orig_${IFACE}
+	$IP6TABLES -t mangle -A QOS_CAKE_${IFACE} -m conntrack --ctreplsrc ${PREFIX} -g QOS_MARK_D_repl_${IFACE}
+
+	# orig direction
+	$IP6TABLES -t mangle -A QOS_MARK_D_orig_${IFACE} \
+	-m connbytes --connbytes ${CONNBUP} --connbytes-dir original --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}O
+	$IP6TABLES -t mangle -A QOS_MARK_D_orig_${IFACE} \
+	-m connbytes --connbytes ${CONNBDN} --connbytes-dir reply --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}O
+
+	# reply direction
+	$IP6TABLES -t mangle -A QOS_MARK_D_repl_${IFACE} \
+	-m connbytes --connbytes ${CONNBDN} --connbytes-dir original --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}R
+	$IP6TABLES -t mangle -A QOS_MARK_D_repl_${IFACE} \
+	-m connbytes --connbytes ${CONNBUP} --connbytes-dir reply --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}R
+fi
+
+# <<< --- End of the hook
+
+# After having set up all the above rules, the final task is to get the firewall to actually run them
+# Hook the above rules into the firewall path
+ipt -t mangle -A POSTROUTING -o ${IFACE} -m connmark --mark 0/${DSCPF} -j QOS_CAKE_${IFACE}
+
+}
+
+ipt_destruct() {
+	ipt -t mangle -D POSTROUTING -o ${IFACE} -m connmark --mark 0/${DSCPF} -j QOS_CAKE_${IFACE}
+	ipt -t mangle -F QOS_MARK_F_${IFACE}
+	ipt -t mangle -F QOS_MARK_F_REMAP_${IFACE}
+	ipt -t mangle -F QOS_MARK_D_orig_${IFACE}
+	ipt -t mangle -F QOS_MARK_D_repl_${IFACE}
+	ipt -t mangle -F QOS_MARK_D_${IFACE}O
+	ipt -t mangle -F QOS_MARK_D_${IFACE}R
+	ipt -t mangle -F QOS_CAKE_${IFACE}
+
+	ipt -t mangle -X QOS_MARK_F_${IFACE}
+	ipt -t mangle -X QOS_MARK_F_REMAP_${IFACE}
+	ipt -t mangle -X QOS_MARK_D_orig_${IFACE}
+	ipt -t mangle -X QOS_MARK_D_repl_${IFACE}
+	ipt -t mangle -X QOS_MARK_D_${IFACE}O
+	ipt -t mangle -X QOS_MARK_D_${IFACE}R
+	ipt -t mangle -X QOS_CAKE_${IFACE}
+}
+
+sqm_prepare_script() {
+	do_modules
+	verify_qdisc $QDISC "cake" || return 1
+	ipt_setup
+}
