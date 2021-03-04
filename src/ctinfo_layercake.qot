@@ -27,6 +27,7 @@ DSCPF=$(( 4 << ${SHIFTVAL} ))
 DSCPN=$(( 2 << ${SHIFTVAL} ))
 DSCPD=$(( 1 << ${SHIFTVAL} ))
 DSCPSF=$(( ${DSCPS} | ${DSCPF} ))
+DSCPSN=$(( ${DSCPS} | ${DSCPN} ))
 DSCPFN=$(( ${DSCPN} | ${DSCPF} ))
 DSCPFND=$(( ${DSCPF} | ${DSCPN} | ${DSCPD} ))
 
@@ -99,6 +100,11 @@ ipt_setup() {
     ipt -t mangle -N QOS_SQM_UFo_${IFACE}
     ipt -t mangle -N QOS_SQM_UFr_${IFACE}
     ipt -t mangle -N QOS_NFA_UN_${IFACE}
+    ipt -t mangle -N QOS_NFA_UNLE_${IFACE}
+    ipt -t mangle -N QOS_NFA_UNBK_${IFACE}
+    ipt -t mangle -N QOS_NFA_UNBE_${IFACE}
+    ipt -t mangle -N QOS_NFA_UNVI_${IFACE}
+    ipt -t mangle -N QOS_NFA_UNVO_${IFACE}
 
 # 'non-dynamic, fixed' rules
 #
@@ -231,29 +237,39 @@ $IP6TABLES -t mangle -A QOS_SQM_UFR_${IFACE} -j SET --add-set BK_6 src --exist
 # <<< --- End of Dynamic Rules
 
 # netify integration
-#ipv4
-if [ "${LESUPPORT}" = 1 ]; then
-	$IPTABLES -t mangle -A QOS_NFA_UN_eth0 -m set --match-set NFA4_PRIO_LE dst,dst,src -j DSCP --set-dscp 1
-fi
-$IPTABLES -t mangle -A QOS_NFA_UN_eth0 -m set --match-set NFA4_PRIO_BK dst,dst,src -j DSCP --set-dscp-class CS1
-$IPTABLES -t mangle -A QOS_NFA_UN_eth0 -m set --match-set NFA4_PRIO_BE dst,dst,src -j CONNMARK --set-xmark ${DSCPN}/${DSCPN}
-$IPTABLES -t mangle -A QOS_NFA_UN_eth0 -m set --match-set NFA4_PRIO_VI dst,dst,src -j DSCP --set-dscp-class CS3
-$IPTABLES -t mangle -A QOS_NFA_UN_eth0 -m set --match-set NFA4_PRIO_VO dst,dst,src -j DSCP --set-dscp-class CS4
 
-$IPTABLES -t mangle -A QOS_NFA_UN_eth0 -j CONNMARK --set-dscpmark ${DSCP}/${DSCPS}
-$IPTABLES -t mangle -A QOS_NFA_UN_eth0 -m connmark ! --mark 0/${DSCP} -j CONNMARK --set-xmark ${DSCPN}/${DSCPN}
+ipt -t mangle -A QOS_NFA_UNLE_${IFACE} -j DSCP --set-dscp 1
+ipt -t mangle -A QOS_NFA_UNLE_${IFACE} -j CONNMARK --set-dscpmark ${DSCP}/${DSCPSN}
+
+ipt -t mangle -A QOS_NFA_UNBK_${IFACE} -j DSCP --set-dscp-class CS1
+ipt -t mangle -A QOS_NFA_UNBK_${IFACE} -j CONNMARK --set-dscpmark ${DSCP}/${DSCPSN}
+
+ipt -t mangle -A QOS_NFA_UNBE_${IFACE} -j CONNMARK --set-dscpmark ${DSCP}/${DSCPSN}
+
+ipt -t mangle -A QOS_NFA_UNVI_${IFACE} -j DSCP --set-dscp-class CS3
+ipt -t mangle -A QOS_NFA_UNVI_${IFACE} -j CONNMARK --set-dscpmark ${DSCP}/${DSCPSN}
+
+ipt -t mangle -A QOS_NFA_UNVO_${IFACE} -j DSCP --set-dscp-class CS4
+ipt -t mangle -A QOS_NFA_UNVO_${IFACE} -j CONNMARK --set-dscpmark ${DSCP}/${DSCPSN}
+
+#ipv4
+$IPTABLES -t mangle -A QOS_NFA_UN_${IFACE} -m set --match-set NFA4_PRIO_VO dst,dst,src -g QOS_NFA_UNVO_${IFACE}
+$IPTABLES -t mangle -A QOS_NFA_UN_${IFACE} -m set --match-set NFA4_PRIO_VI dst,dst,src -g QOS_NFA_UNVI_${IFACE}
+$IPTABLES -t mangle -A QOS_NFA_UN_${IFACE} -m set --match-set NFA4_PRIO_BE dst,dst,src -g QOS_NFA_UNBE_${IFACE}
+$IPTABLES -t mangle -A QOS_NFA_UN_${IFACE} -m set --match-set NFA4_PRIO_BK dst,dst,src -g QOS_NFA_UNBK_${IFACE}
+if [ "${LESUPPORT}" = 1 ]; then
+	$IPTABLES -t mangle -A QOS_NFA_UN_${IFACE} -m set --match-set NFA4_PRIO_LE dst,dst,src -g QOS_NFA_UNLE_${IFACE}
+fi
 
 #ipv6
+$IP6TABLES -t mangle -A QOS_NFA_UN_${IFACE} -m set --match-set NFA6_PRIO_VO dst,dst,src -g QOS_NFA_UNVO_${IFACE}
+$IP6TABLES -t mangle -A QOS_NFA_UN_${IFACE} -m set --match-set NFA6_PRIO_VI dst,dst,src -g QOS_NFA_UNVI_${IFACE}
+$IP6TABLES -t mangle -A QOS_NFA_UN_${IFACE} -m set --match-set NFA6_PRIO_BE dst,dst,src -g QOS_NFA_UNBE_${IFACE}
+$IP6TABLES -t mangle -A QOS_NFA_UN_${IFACE} -m set --match-set NFA6_PRIO_BK dst,dst,src -g QOS_NFA_UNBK_${IFACE}
 if [ "${LESUPPORT}" = 1 ]; then
-	$IP6TABLES -t mangle -A QOS_NFA_UN_eth0 -m set --match-set NFA6_PRIO_LE dst,dst,src -j DSCP --set-dscp 1
+	$IP6TABLES -t mangle -A QOS_NFA_UN_${IFACE} -m set --match-set NFA6_PRIO_LE dst,dst,src -g QOS_NFA_UNLE_${IFACE}
 fi
-$IP6TABLES -t mangle -A QOS_NFA_UN_eth0 -m set --match-set NFA6_PRIO_BK dst,dst,src -j DSCP --set-dscp-class CS1
-$IP6TABLES -t mangle -A QOS_NFA_UN_eth0 -m set --match-set NFA6_PRIO_BE dst,dst,src -j CONNMARK --set-xmark ${DSCPN}/${DSCPN}
-$IP6TABLES -t mangle -A QOS_NFA_UN_eth0 -m set --match-set NFA6_PRIO_VI dst,dst,src -j DSCP --set-dscp-class CS3
-$IP6TABLES -t mangle -A QOS_NFA_UN_eth0 -m set --match-set NFA6_PRIO_VO dst,dst,src -j DSCP --set-dscp-class CS4
 
-$IP6TABLES -t mangle -A QOS_NFA_UN_eth0 -j CONNMARK --set-dscpmark ${DSCP}/${DSCPS}
-$IP6TABLES -t mangle -A QOS_NFA_UN_eth0 -m connmark ! --mark 0/${DSCP} -j CONNMARK --set-xmark ${DSCPN}/${DSCPN}
 # <<< -- End of netify integration
 
 # >>> It all starts here.  This is the entry point that combines all the above rules
@@ -322,6 +338,11 @@ ipt_destruct() {
 	ipt -t mangle -D POSTROUTING -o ${IFACE} -m connmark --mark 0/${DSCPFND} -j QOS_SQM_${IFACE}
 	ipt -t mangle -F QOS_SQM_US_${IFACE}
 	ipt -t mangle -F QOS_SQM_US_REMAP_${IFACE}
+	ipt -t mangle -F QOS_NFA_UNLE_${IFACE}
+	ipt -t mangle -F QOS_NFA_UNBK_${IFACE}
+	ipt -t mangle -F QOS_NFA_UNBE_${IFACE}
+	ipt -t mangle -F QOS_NFA_UNVI_${IFACE}
+	ipt -t mangle -F QOS_NFA_UNVO_${IFACE}
 	ipt -t mangle -F QOS_NFA_UN_${IFACE}
 	ipt -t mangle -F QOS_SQM_UFo_${IFACE}
 	ipt -t mangle -F QOS_SQM_UFr_${IFACE}
@@ -331,6 +352,11 @@ ipt_destruct() {
 
 	ipt -t mangle -X QOS_SQM_US_${IFACE}
 	ipt -t mangle -X QOS_SQM_US_REMAP_${IFACE}
+	ipt -t mangle -X QOS_NFA_UNLE_${IFACE}
+	ipt -t mangle -X QOS_NFA_UNBK_${IFACE}
+	ipt -t mangle -X QOS_NFA_UNBE_${IFACE}
+	ipt -t mangle -X QOS_NFA_UNVI_${IFACE}
+	ipt -t mangle -X QOS_NFA_UNVO_${IFACE}
 	ipt -t mangle -X QOS_NFA_UN_${IFACE}
 	ipt -t mangle -X QOS_SQM_UFo_${IFACE}
 	ipt -t mangle -X QOS_SQM_UFr_${IFACE}
